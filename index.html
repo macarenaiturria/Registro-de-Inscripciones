@@ -196,6 +196,10 @@
     font-size:22px;font-weight:bold;margin:0 auto 12px;
   }
   .success-modal-msg{font-size:14px;color:var(--navy-900);margin:0 0 18px;font-weight:bold;}
+  .progress-wrap{display:flex;align-items:center;gap:10px;margin-top:10px;max-width:420px;}
+  .progress-bar{flex:1;height:10px;background:var(--navy-100);border-radius:6px;overflow:hidden;}
+  .progress-fill{height:100%;width:0%;background:var(--red-600);border-radius:6px;transition:width .15s ease;}
+  .progress-label{font-size:12px;font-weight:bold;color:var(--navy-800);min-width:36px;text-align:right;}
   .upload-note{font-size:11px;color:var(--ink-soft);margin-top:8px;}
   .step-num{
     display:inline-flex;align-items:center;justify-content:center;
@@ -416,6 +420,10 @@
         <input type="file" id="fileExcel" accept=".xlsx,.xls,.csv">
         <p class="upload-note">Formatos aceptados: .xlsx, .xls, .csv</p>
         <button class="btn btn-primary btn-sm" id="btnCargarExcel" type="button" style="margin-top:10px;">Cargar</button>
+        <div class="progress-wrap" id="excelProgressWrap" style="display:none;">
+          <div class="progress-bar"><div class="progress-fill" id="excelProgressFill"></div></div>
+          <span class="progress-label" id="excelProgressLabel">0%</span>
+        </div>
       </div>
       <div class="stat-row" id="excelStats" style="display:none;">
         <div class="stat-box"><div class="stat-num" id="statLeidos">0</div><div class="stat-label">Filas leídas</div></div>
@@ -441,6 +449,10 @@
         <input type="file" id="filePdfFolder" webkitdirectory directory multiple>
         <p class="upload-note">Selecciona la carpeta local sincronizada con los títulos en PDF.</p>
         <button class="btn btn-primary btn-sm" id="btnCargarPdfs" type="button" style="margin-top:10px;">Cargar</button>
+        <div class="progress-wrap" id="pdfProgressWrap" style="display:none;">
+          <div class="progress-bar"><div class="progress-fill" id="pdfProgressFill"></div></div>
+          <span class="progress-label" id="pdfProgressLabel">0%</span>
+        </div>
       </div>
       <div class="stat-row" id="pdfStats" style="display:none;">
         <div class="stat-box"><div class="stat-num" id="statPdfsDetectados">0</div><div class="stat-label">PDFs detectados</div></div>
@@ -790,13 +802,34 @@ function normEstadoSistema(v){
 }
 const SI_NO_FIELDS = new Set(["inscrito","tieneReparo","cbrRechazo","reingresadoCBR","respuestaCBR"]);
 
-function handleExcelUpload(file){
+function setProgress(wrapId, fillId, labelId, pct){
+  const wrap = document.getElementById(wrapId);
+  wrap.style.display = "flex";
+  document.getElementById(fillId).style.width = pct + "%";
+  document.getElementById(labelId).textContent = Math.round(pct) + "%";
+}
+function hideProgress(wrapId){
+  document.getElementById(wrapId).style.display = "none";
+}
+// deja respirar al hilo principal entre lotes, para poder pintar la barra de progreso
+function nextFrame(){ return new Promise(res=> setTimeout(res, 0)); }
+
+async function handleExcelUpload(file){
+  setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", 0);
   const reader = new FileReader();
-  reader.onload = (e)=>{
+  reader.onprogress = (e)=>{
+    if(e.lengthComputable){
+      // lectura del archivo: 0% a 25% de la barra total
+      setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", (e.loaded/e.total)*25);
+    }
+  };
+  reader.onload = async (e)=>{
+    setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", 25);
     const wb = XLSX.read(e.target.result, {type:"array"});
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:"", raw:false});
-    if(!rows.length) return;
+    if(!rows.length){ hideProgress("excelProgressWrap"); return; }
+    setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", 35);
 
     // arma el mapa de columna -> campo, resolviendo encabezados duplicados por posición
     // (ej: "INSCRITO?" aparece dos veces; la segunda corresponde realmente a Estado Sistema)
@@ -821,36 +854,44 @@ function handleExcelUpload(file){
     const dataRows = rows.slice(1);
 
     let completos = 0, incompletos = 0, nuevos = 0, sinExpediente = 0;
-    dataRows.forEach(cols=>{
-      if(cols.every(c=>String(c).trim()==="")) return; // fila vacía
-      const rec = {};
-      colField.forEach((field,i)=>{
-        if(!field) return;
-        const raw = cols[i] !== undefined ? String(cols[i]).trim() : "";
-        if(field === "estadoSistemaSiNo" || field === "estadoSistema"){
-          rec.estadoSistema = normEstadoSistema(raw);
-        } else if(SI_NO_FIELDS.has(field)){
-          rec[field] = siNo(raw);
-        } else if(field === "unidadMedida"){
-          rec[field] = normUnidad(raw);
-        } else {
-          rec[field] = raw;
+    const BATCH = 4000;
+    for(let start=0; start<dataRows.length; start+=BATCH){
+      const batch = dataRows.slice(start, start+BATCH);
+      batch.forEach(cols=>{
+        if(cols.every(c=>String(c).trim()==="")) return; // fila vacía
+        const rec = {};
+        colField.forEach((field,i)=>{
+          if(!field) return;
+          const raw = cols[i] !== undefined ? String(cols[i]).trim() : "";
+          if(field === "estadoSistemaSiNo" || field === "estadoSistema"){
+            rec.estadoSistema = normEstadoSistema(raw);
+          } else if(SI_NO_FIELDS.has(field)){
+            rec[field] = siNo(raw);
+          } else if(field === "unidadMedida"){
+            rec[field] = normUnidad(raw);
+          } else {
+            rec[field] = raw;
+          }
+        });
+
+        if(!rec.numExpediente){ sinExpediente++; return; } // sin N° de expediente no es identificable, se omite
+
+        const completo = isComplete(rec);
+        if(completo) completos++; else incompletos++;
+
+        const existingIdx = dataset.findIndex(d=>normKey(d.numExpediente)===normKey(rec.numExpediente));
+        if(existingIdx === -1){
+          dataset.push(rec); nuevos++;
+        } else if(completo){
+          // no sobrescribe salvo que el registro entrante venga explícitamente completo
+          dataset[existingIdx] = Object.assign({}, dataset[existingIdx], rec);
         }
       });
-
-      if(!rec.numExpediente){ sinExpediente++; return; } // sin N° de expediente no es identificable, se omite
-
-      const completo = isComplete(rec);
-      if(completo) completos++; else incompletos++;
-
-      const existingIdx = dataset.findIndex(d=>normKey(d.numExpediente)===normKey(rec.numExpediente));
-      if(existingIdx === -1){
-        dataset.push(rec); nuevos++;
-      } else if(completo){
-        // no sobrescribe salvo que el registro entrante venga explícitamente completo
-        dataset[existingIdx] = Object.assign({}, dataset[existingIdx], rec);
-      }
-    });
+      // 35% a 95% de la barra según filas procesadas
+      const pctFilas = Math.min(1, (start+batch.length)/dataRows.length);
+      setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", 35 + pctFilas*60);
+      await nextFrame();
+    }
 
     document.getElementById("excelStats").style.display = "flex";
     document.getElementById("statLeidos").textContent = dataRows.length.toLocaleString("es-CL");
@@ -876,6 +917,8 @@ function handleExcelUpload(file){
     document.getElementById("btnCotejar").disabled = false;
     filtered = dataset.slice();
     renderTable();
+    setProgress("excelProgressWrap","excelProgressFill","excelProgressLabel", 100);
+    setTimeout(()=> hideProgress("excelProgressWrap"), 800);
     showSuccessModal("Carga realizada exitosamente");
   };
   reader.readAsArrayBuffer(file);
@@ -1035,13 +1078,24 @@ document.getElementById("btnCargarExcel").addEventListener("click", ()=>{
   if(!f){ alert("Primero selecciona un archivo Excel."); return; }
   handleExcelUpload(f);
 });
-document.getElementById("btnCargarPdfs").addEventListener("click", ()=>{
-  const files = Array.from(document.getElementById("filePdfFolder").files).filter(f=> /\.pdf$/i.test(f.name));
-  if(!files.length){ alert("Primero selecciona una carpeta con archivos PDF."); return; }
-  selectedPdfFiles = files;
+document.getElementById("btnCargarPdfs").addEventListener("click", async ()=>{
+  const allFiles = Array.from(document.getElementById("filePdfFolder").files);
+  if(!allFiles.length){ alert("Primero selecciona una carpeta con archivos PDF."); return; }
+  setProgress("pdfProgressWrap","pdfProgressFill","pdfProgressLabel", 0);
+  const pdfs = [];
+  const BATCH = 5000;
+  for(let start=0; start<allFiles.length; start+=BATCH){
+    const batch = allFiles.slice(start, start+BATCH);
+    batch.forEach(f=>{ if(/\.pdf$/i.test(f.name)) pdfs.push(f); });
+    setProgress("pdfProgressWrap","pdfProgressFill","pdfProgressLabel", Math.min(100, ((start+batch.length)/allFiles.length)*100));
+    await nextFrame();
+  }
+  if(!pdfs.length){ hideProgress("pdfProgressWrap"); alert("La carpeta seleccionada no contiene archivos PDF."); return; }
+  selectedPdfFiles = pdfs;
   document.getElementById("pdfStats").style.display = "flex";
   document.getElementById("statPdfsDetectados").textContent = selectedPdfFiles.length.toLocaleString("es-CL");
   document.getElementById("btnCotejar").disabled = false;
+  setTimeout(()=> hideProgress("pdfProgressWrap"), 800);
   showSuccessModal("Carga realizada exitosamente");
 });
 document.getElementById("btnCotejar").addEventListener("click", runCotejo);
